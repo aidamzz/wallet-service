@@ -1,0 +1,117 @@
+import requests
+from celery import shared_task
+from django.db import transaction
+from django.utils import timezone
+
+from wallets.models import Transaction, Wallet
+
+MAX_RETRIES = 5
+
+
+def mark_dead(tx: Transaction):
+    tx.is_dead = True
+    tx.status = Transaction.FAILED
+    tx.save(update_fields=["is_dead", "status", "updated_at"])
+
+
+@shared_task(
+    bind=True,
+    max_retries=MAX_RETRIES,
+    retry_backoff=True,
+    retry_backoff_max=300,
+    retry_jitter=True
+)
+def process_withdrawals(self):
+    now = timezone.now()
+
+    due_ids = list(
+        Transaction.objects.filter(
+            type=Transaction.WITHDRAW,
+            status=Transaction.PENDING,
+            execute_at__lte=now,
+            is_dead=False,
+        ).values_list("id", flat=True)
+    )
+
+    for tx_id in due_ids:
+        # Step 1: claim (PENDING -> PROCESSING) under lock, and validate balance
+        try:
+            with transaction.atomic():
+                tx = (
+                    Transaction.objects
+                    .select_for_update()
+                    .get(id=tx_id)
+                )
+
+                if tx.status != Transaction.PENDING or tx.is_dead:
+                    continue
+
+                wallet = (
+                    Wallet.objects
+                    .select_for_update()
+                    .get(id=tx.wallet_id)
+                )
+
+                # validate at execution time
+                if wallet.balance < tx.amount:
+                    tx.status = Transaction.FAILED
+                    tx.save(update_fields=["status", "updated_at"])
+                    continue
+
+                # Claim it so no other worker calls the bank
+                tx.status = Transaction.PROCESSING
+                tx.save(update_fields=["status", "updated_at"])
+
+            # Step 2: call bank OUTSIDE DB transaction
+            headers = {"Idempotency-Key": str(tx.idempotency_key)}
+            resp = requests.post("http://host.docker.internal:8010/", headers=headers, timeout=5)
+
+            payload = resp.json()
+            if payload.get("status") != 200:
+                raise Exception("Bank failed")
+
+            # Step 3: finalize success under lock
+            with transaction.atomic():
+                tx = Transaction.objects.select_for_update().get(id=tx_id)
+
+                # someone changed it (shouldn't happen, but safe)
+                if tx.status != Transaction.PROCESSING or tx.is_dead:
+                    continue
+
+                wallet = Wallet.objects.select_for_update().get(id=tx.wallet_id)
+                if wallet.balance < tx.amount:
+                    # balance changed while we were calling bank
+                    tx.status = Transaction.FAILED
+                    tx.save(update_fields=["status", "updated_at"])
+                    continue
+
+                wallet.balance -= tx.amount
+                wallet.save(update_fields=["balance"])
+
+                tx.status = Transaction.SUCCESS
+                tx.save(update_fields=["status", "updated_at"])
+
+        except requests.exceptions.RequestException as exc:
+            # return it to PENDING so it can retry later
+            with transaction.atomic():
+                tx = Transaction.objects.select_for_update().get(id=tx_id)
+                if tx.status == Transaction.PROCESSING and not tx.is_dead:
+                    tx.retry_count += 1
+                    if tx.retry_count >= MAX_RETRIES:
+                        mark_dead(tx)
+                        continue
+                    tx.status = Transaction.PENDING
+                    tx.save(update_fields=["retry_count", "status", "updated_at"])
+            raise self.retry(exc=exc)
+
+        except Exception as exc:
+            with transaction.atomic():
+                tx = Transaction.objects.select_for_update().get(id=tx_id)
+                if tx.status == Transaction.PROCESSING and not tx.is_dead:
+                    tx.retry_count += 1
+                    if tx.retry_count >= MAX_RETRIES:
+                        mark_dead(tx)
+                        continue 
+                    tx.status = Transaction.PENDING
+                    tx.save(update_fields=["retry_count", "status", "updated_at"])
+            raise self.retry(exc=exc)
