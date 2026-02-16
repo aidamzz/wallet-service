@@ -86,7 +86,19 @@ class ScheduleWithdrawView(APIView):
                 status=400
             )
 
-        amount = int(amount)
+        try:
+            amount = int(amount)
+        except (TypeError, ValueError):
+            return Response(
+                {"error": "amount must be an integer"},
+                status=400
+            )
+
+        if amount <= 0:
+            return Response(
+                {"error": "Invalid amount"},
+                status=400
+            )
         
         execute_at = parse_datetime(execute_at)
         if execute_at is None:

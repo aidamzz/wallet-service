@@ -2,7 +2,7 @@ import requests
 from celery import shared_task
 from django.db import transaction
 from django.utils import timezone
-
+from django.db.models import Q
 from wallets.models import Transaction, Wallet
 
 MAX_RETRIES = 5
@@ -27,14 +27,16 @@ def process_withdrawals(self):
     due_ids = list(
         Transaction.objects.filter(
             type=Transaction.WITHDRAW,
-            status=Transaction.PENDING,
+            status__in=[Transaction.PENDING, Transaction.PROCESSING],
             execute_at__lte=now,
             is_dead=False,
         ).values_list("id", flat=True)
     )
 
     for tx_id in due_ids:
-        # Step 1: claim (PENDING -> PROCESSING) under lock, and validate balance
+        # Step 1: under lock:
+        # - if PENDING: validate and RESERVE (deduct) funds, then set PROCESSING
+        # - if already PROCESSING: funds were already reserved; just continue to bank call
         try:
             with transaction.atomic():
                 tx = (
@@ -43,7 +45,7 @@ def process_withdrawals(self):
                     .get(id=tx_id)
                 )
 
-                if tx.status != Transaction.PENDING or tx.is_dead:
+                if tx.is_dead or tx.status not in [Transaction.PENDING, Transaction.PROCESSING]:
                     continue
 
                 wallet = (
@@ -52,19 +54,28 @@ def process_withdrawals(self):
                     .get(id=tx.wallet_id)
                 )
 
-                # validate at execution time
-                if wallet.balance < tx.amount:
-                    tx.status = Transaction.FAILED
-                    tx.save(update_fields=["status", "updated_at"])
-                    continue
+                if tx.status == Transaction.PENDING:
+                    # validate at execution time
+                    if wallet.balance < tx.amount:
+                        tx.status = Transaction.FAILED
+                        tx.save(update_fields=["status", "updated_at"])
+                        continue
 
-                # Claim it so no other worker calls the bank
-                tx.status = Transaction.PROCESSING
-                tx.save(update_fields=["status", "updated_at"])
+                    # RESERVE funds now (prevents concurrent overspend)
+                    wallet.balance -= tx.amount
+                    wallet.save(update_fields=["balance"])
+
+                    tx.status = Transaction.PROCESSING
+                    tx.save(update_fields=["status", "updated_at"])
 
             # Step 2: call bank OUTSIDE DB transaction
             headers = {"Idempotency-Key": str(tx.idempotency_key)}
-            resp = requests.post("http://host.docker.internal:8010/", headers=headers, timeout=5)
+            resp = requests.post(
+                "http://host.docker.internal:8010/",
+                headers=headers,
+                json={"amount": tx.amount},
+                timeout=5,
+            )
 
             payload = resp.json()
             if payload.get("status") != 200:
@@ -78,40 +89,42 @@ def process_withdrawals(self):
                 if tx.status != Transaction.PROCESSING or tx.is_dead:
                     continue
 
-                wallet = Wallet.objects.select_for_update().get(id=tx.wallet_id)
-                if wallet.balance < tx.amount:
-                    # balance changed while we were calling bank
-                    tx.status = Transaction.FAILED
-                    tx.save(update_fields=["status", "updated_at"])
-                    continue
-
-                wallet.balance -= tx.amount
-                wallet.save(update_fields=["balance"])
-
                 tx.status = Transaction.SUCCESS
                 tx.save(update_fields=["status", "updated_at"])
 
         except requests.exceptions.RequestException as exc:
-            # return it to PENDING so it can retry later
+            
             with transaction.atomic():
                 tx = Transaction.objects.select_for_update().get(id=tx_id)
                 if tx.status == Transaction.PROCESSING and not tx.is_dead:
                     tx.retry_count += 1
                     if tx.retry_count >= MAX_RETRIES:
+                        # refund reserved funds if we’re giving up
+                        wallet = Wallet.objects.select_for_update().get(id=tx.wallet_id)
+                        wallet.balance += tx.amount
+                        wallet.save(update_fields=["balance"])
                         mark_dead(tx)
                         continue
-                    tx.status = Transaction.PENDING
-                    tx.save(update_fields=["retry_count", "status", "updated_at"])
+                    tx.save(update_fields=["retry_count", "updated_at"])
             raise self.retry(exc=exc)
 
         except Exception as exc:
             with transaction.atomic():
                 tx = Transaction.objects.select_for_update().get(id=tx_id)
+
                 if tx.status == Transaction.PROCESSING and not tx.is_dead:
                     tx.retry_count += 1
+
                     if tx.retry_count >= MAX_RETRIES:
+                        # refund 
+                        wallet = Wallet.objects.select_for_update().get(id=tx.wallet_id)
+                        wallet.balance += tx.amount
+                        wallet.save(update_fields=["balance"])
+
                         mark_dead(tx)
-                        continue 
-                    tx.status = Transaction.PENDING
-                    tx.save(update_fields=["retry_count", "status", "updated_at"])
+                        continue
+
+                    tx.save(update_fields=["retry_count", "updated_at"])
+
             raise self.retry(exc=exc)
+
