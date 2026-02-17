@@ -4,7 +4,7 @@ from django.db import transaction
 from django.utils import timezone
 from django.db.models import Q
 from wallets.models import Transaction, Wallet
-
+from wallets.utils import request_third_party_deposit
 MAX_RETRIES = 5
 
 
@@ -69,16 +69,12 @@ def process_withdrawals(self):
                     tx.save(update_fields=["status", "updated_at"])
 
             # Step 2: call bank OUTSIDE DB transaction
-            headers = {"Idempotency-Key": str(tx.idempotency_key)}
-            resp = requests.post(
-                "http://host.docker.internal:8010/",
-                headers=headers,
-                json={"amount": tx.amount},
-                timeout=5,
+            payload = request_third_party_deposit(
+                amount=tx.amount,
+                idempotency_key=tx.idempotency_key,
             )
 
-            payload = resp.json()
-            if payload.get("status") != 200:
+            if payload.get("status") not in (200):
                 raise Exception("Bank failed")
 
             # Step 3: finalize success under lock

@@ -1,7 +1,7 @@
 from rest_framework.generics import CreateAPIView, RetrieveAPIView
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from wallets.serializers import WalletSerializer
+from wallets.serializers import WalletSerializer, TransactionSerializer
 from django.db import transaction
 from rest_framework import status
 from wallets.models import Wallet, Transaction
@@ -31,13 +31,13 @@ class CreateDepositView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        amount = int(amount)
+        try:
+            amount = int(amount)
+        except (TypeError, ValueError):
+            return Response({"error": "amount must be an integer"}, status=status.HTTP_400_BAD_REQUEST)
 
         if amount <= 0:
-            return Response(
-                {"error": "Invalid amount"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            return Response({"error": "Invalid amount"}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
             with transaction.atomic():
@@ -134,3 +134,8 @@ class ScheduleWithdrawView(APIView):
             status=201
         )
 
+
+class RetrieveTransactionView(RetrieveAPIView):
+    serializer_class = TransactionSerializer
+    queryset = Transaction.objects.all()
+    lookup_field = "id"
