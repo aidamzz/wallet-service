@@ -8,3 +8,6 @@ gunicorn
 django-celery-beat
 python-dotenv
 django-redis>=5.4.0
+pytest
+pytest-django
+pytest-mock

@@ -61,7 +61,7 @@ def process_withdrawals(self):
                         tx.save(update_fields=["status", "updated_at"])
                         continue
 
-                    # RESERVE funds now (prevents concurrent overspend)
+                    # RESERVE funds (prevents concurrent overspend)
                     wallet.balance -= tx.amount
                     wallet.save(update_fields=["balance"])
 
@@ -74,14 +74,13 @@ def process_withdrawals(self):
                 idempotency_key=tx.idempotency_key,
             )
 
-            if payload.get("status") not in (200):
+            if payload.get("status") != 200:
                 raise Exception("Bank failed")
 
             # Step 3: finalize success under lock
             with transaction.atomic():
                 tx = Transaction.objects.select_for_update().get(id=tx_id)
 
-                # someone changed it (shouldn't happen, but safe)
                 if tx.status != Transaction.PROCESSING or tx.is_dead:
                     continue
 
